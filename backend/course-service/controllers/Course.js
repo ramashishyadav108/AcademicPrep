@@ -1,0 +1,968 @@
+import Course from '../models/Course.js'
+import Category from '../models/Category.js'
+import Section from "../models/Section.js"
+import SubSection from "../models/SubSection.js"
+import { uploadImagetoCloudinary } from '../../shared-utils/imageUploader.js'
+import mongoose from 'mongoose'
+import { userService } from '../utils/serviceClients.js'
+import CourseProgress from '../models/CourseProgress.js'
+
+import dotenv from 'dotenv';
+dotenv.config();
+
+const decodeHtmlEntities = (str) => {
+  if (!str || typeof str !== 'string') return str;
+  return str
+    .replace(/&#x2F;/gi, '/')
+    .replace(/&#x27;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"');
+};
+
+export const editCourse = async (req, res) => {
+    try {
+        const { courseId } = req.body;
+        if (!courseId) {
+            return res.status(400).json({
+                success: false,
+                message: "Course ID is required",
+            });
+        }
+
+        const {
+            courseName,
+            courseDescription,
+            whatYouWillLearn,
+            price,
+            category,
+            email,
+            status = "Draft",
+        } = req.body;
+
+        let tags = req.body.tag ? JSON.parse(req.body.tag) : [];
+        let instructions = req.body.instructions ? JSON.parse(req.body.instructions) : [];
+        const thumbnail = req.files?.thumbnailImage;
+
+        // Validate status
+        const validStatuses = ["Draft", "Published"];
+        if (!validStatuses.includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid course status provided",
+            });
+        }
+
+        // Find existing course
+        const existingCourse = await Course.findById(courseId);
+        if (!existingCourse) {
+            return res.status(404).json({
+                success: false,
+                message: "Course not found",
+            });
+        }
+
+        // Upload new thumbnail if provided
+        let updatedThumbnail = existingCourse.thumbnail;
+        if (thumbnail) {
+            const uploadDetails = await uploadImagetoCloudinary(thumbnail, "Study-Notion");
+            updatedThumbnail = uploadDetails.secure_url;
+        }
+
+        // Update course details
+        const updatedCourse = await Course.findByIdAndUpdate(
+            courseId,
+            {
+                courseName: courseName || existingCourse.courseName,
+                courseDescription: courseDescription || existingCourse.courseDescription,
+                whatYouWillLearn: whatYouWillLearn || existingCourse.whatYouWillLearn,
+                price: price || existingCourse.price,
+                category: category || existingCourse.category,
+                status: status || existingCourse.status,
+                tag: tags.length > 0 ? tags : existingCourse.tag,
+                instructions: instructions.length > 0 ? instructions : existingCourse.instructions,
+                thumbnail: updatedThumbnail,
+            },
+            { new: true }
+        )
+        .populate("category")
+        .populate({
+            path: "courseContent",
+            populate: {
+                path: "subSection",
+            },
+        });
+
+        // Get instructor details via user-service
+        let instructorDetails = null;
+        if (updatedCourse.instructor) {
+            try {
+                const instructorResponse = await userService.get('/auth/get-instructors-by-ids', {
+                    params: { ids: updatedCourse.instructor, fields: 'firstName,lastName,image,additionalDetails' },
+                });
+                instructorDetails = instructorResponse.data?.data?.[0];
+            } catch (error) {
+                console.error("Error fetching instructor details:", error.message);
+                // Continue without instructor details if user service is unavailable
+            }
+        }
+
+        // Merge instructor details with course data
+        const result = {
+            ...updatedCourse.toObject(),
+            instructor: instructorDetails || updatedCourse.instructor,
+        };
+
+        return res.status(200).json({
+            success: true,
+            message: "Course details updated successfully",
+            data: result,
+        });
+
+    } catch (error) {
+        console.error("Error updating course details:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Error updating course details, please try again",
+        });
+    }
+};
+
+export const createCourse = async (req, res) => {
+    try {
+        const { courseName, courseDescription, whatYouWillLearn, price, category, email, status = "Draft" } = req.body;
+        const thumbnail = req.files?.thumbnailImage;
+        let tags = req.body.tag ? JSON.parse(req.body.tag) : []; // Parse tags properly
+        let instructions = req.body.instructions ? JSON.parse(req.body.instructions) : [];
+
+        // Validate required fields
+        if (!courseName || !courseDescription || !whatYouWillLearn || !price || !category || !tags.length || !instructions.length) {
+            return res.status(400).json({
+                success: false,
+                message: "Fields can't be empty..."
+            });
+        }
+
+        // Find instructor details via User Service API
+        let instructorDetails;
+        try {
+            const userResponse = await userService.get(`/auth/user-by-email/${email}`);
+            if (!userResponse.data.success) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Can't find instructor details..."
+                });
+            }
+            instructorDetails = userResponse.data.user;
+        } catch (error) {
+            console.error("Error calling User Service:", error.message);
+            return res.status(500).json({
+                success: false,
+                message: "Error communicating with User Service"
+            });
+        }
+
+        // Find category details
+        const categoryDetails = await Category.findById(category);
+        if (!categoryDetails) {
+            return res.status(400).json({
+                success: false,
+                message: "Can't find category..."
+            });
+        }
+
+        // Upload course thumbnail to Cloudinary
+        const thumbnailImage = await uploadImagetoCloudinary(thumbnail, "Study-Notion");
+        // console.log("Cloudinary Response:", thumbnailImage);
+
+        // Create new course
+        let newCourse;
+        try {
+            newCourse = await Course.create({
+                courseName,
+                courseDescription,
+                instructor: instructorDetails._id,
+                whatYouWillLearn,
+                price,
+                category,
+                thumbnail: thumbnailImage.secure_url,
+                tag: tags,
+                instructions: instructions,
+                status: status,
+            });
+
+            // Update instructor by adding the new course via User Service API
+            try {
+                await userService.post('/profile/add-course', {
+                    userId: instructorDetails._id,
+                    courseId: newCourse._id,
+                });
+            } catch (error) {
+                console.error("Error updating instructor courses:", error.message);
+                // Don't fail the course creation, but log the error
+            }
+
+            // ✅ Update category by adding the new course
+            await Category.findByIdAndUpdate(
+                category,
+                { $push: { courses: newCourse._id } },
+                { new: true }
+            );
+
+        } catch (error) {
+            // console.log("Can't create the course:", error);
+            return res.status(400).json({
+                success: false,
+                message: "Can't create the course, please try again",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "New Course Added...",
+            data: newCourse,
+        });
+
+    } catch (error) {
+        console.error("Error creating course:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Some error occurred while creating the course, please try again...",
+        });
+    }
+};
+
+export const showAllCourses = async (req,res)=>{
+    try{
+        const allCourses = await Course.find({}, {
+            courseName: true,
+            price: true,
+            thumbnail: true,
+            instuctor: true,
+            ratingAndReviews: true,
+            studentsEnrolled: true,
+        }).exec();
+
+        // console.log(allCourses)
+
+        return res.status(200).json({
+            success: true,
+            message: "All courses shown successfully...",
+            data: allCourses,
+        })
+    }catch(error){
+        return res.status(400).json({
+            success: false,
+            message: "Some error occured while showing all courses..."
+        })
+    }
+}
+
+export const getCourseDetails = async (req,res)=>{
+    try {
+        const {courseId} = req.body;
+        console.log("courseID", courseId)
+        if(!courseId){
+            return res.status(400).json({
+                success: false,
+                message: "Feilds can't be empty",
+            })
+        }
+        
+        // 1. Get course details without studentsEnrolled and instructor population (to avoid Mongoose error)
+        const courseDetails = await Course.findById(courseId)
+        .populate('ratingAndReviews')
+        .populate('category')
+        .populate({path: 'courseContent',populate:{path: 'subSection'},}).exec();
+
+        if(!courseDetails){
+            return res.status(400).json({
+                success: false,
+                message: "Can't find the course...",
+            })
+        }
+
+        // 2. Get instructor details via user-service
+        let instructorDetails = null;
+        if (courseDetails.instructor) {
+            try {
+                const instructorResponse = await userService.get('/auth/get-instructors-by-ids', {
+                    params: { ids: courseDetails.instructor, fields: 'firstName,lastName,image,additionalDetails' },
+                });
+                console.log("Instructor API response:", instructorResponse.data);
+                instructorDetails = instructorResponse.data?.data?.[0];
+            } catch (error) {
+                console.error("Error fetching instructor details:", error.message);
+                // Continue without instructor details if user service is unavailable
+            }
+        }
+
+        // 3. Get enrolled students details via user-service
+        let studentsDetails = [];
+        if (courseDetails.studentsEnrolled && courseDetails.studentsEnrolled.length > 0) {
+            try {
+                const studentsResponse = await userService.get('/auth/get-instructors-by-ids', {
+                    params: { ids: courseDetails.studentsEnrolled.join(','), fields: 'firstName,lastName,image,additionalDetails' },
+                });
+                studentsDetails = studentsResponse.data?.data || [];
+            } catch (error) {
+                console.error("Error fetching students details:", error.message);
+                // Continue without students details if user service is unavailable
+            }
+        }
+
+        // 3b. Get course progress entries for enrolled students from local CourseProgress model
+        let studentsProgress = [];
+        try {
+          if (courseDetails.studentsEnrolled && courseDetails.studentsEnrolled.length > 0) {
+            studentsProgress = await CourseProgress.find({
+              courseID: courseId,
+              userId: { $in: courseDetails.studentsEnrolled }
+            }).lean();
+          }
+        } catch (err) {
+          console.error('Error fetching course progress entries:', err);
+          studentsProgress = [];
+        }
+        // 4. Merge instructor and students details with course data
+        const result = {
+          ...courseDetails.toObject(),
+          instructor: instructorDetails || courseDetails.instructor,
+          // keep existing students details if available, but also include a compact progress list
+          studentsEnrolled: studentsDetails?.length > 0 ? studentsDetails : courseDetails.studentsEnrolled,
+          studentsProgress: studentsProgress,
+          success: true
+        };
+        
+        return res.status(200).json({
+            success: true,
+            message: "Found course details succesfully...",
+            data: result
+        })
+
+    } catch (error) {
+        console.error("Error getting course details:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Can't get course details",
+            error: error.message,
+        })
+    }
+}
+
+export const getCoursePublicDetails = async (req, res) => {
+  try {
+    const { courseId } = req.body;
+    if (!courseId) {
+      return res.status(400).json({ success: false, message: 'courseId is required' });
+    }
+
+    const course = await Course.findById(courseId)
+      .populate({ path: 'category', select: 'name' })
+      .populate({ path: 'ratingAndReviews', select: 'rating' })
+      .populate({
+        path: 'courseContent',
+        populate: {
+          path: 'subSection',
+          select: '_id title description timeDuration',
+        },
+      })
+      .lean();
+
+    if (!course) {
+      return res.status(404).json({ success: false, message: "Course not found" });
+    }
+
+    // Fetch instructor from user-service
+    let instructor = { _id: course.instructor };
+    if (course.instructor) {
+      try {
+        const resp = await userService.get('/auth/get-instructors-by-ids', {
+          params: { ids: course.instructor, fields: 'firstName,lastName,image,additionalDetails' },
+        });
+        const instructors = resp.data?.data || [];
+        if (instructors[0]) {
+          instructor = {
+            ...instructors[0],
+            image: decodeHtmlEntities(instructors[0].image),
+          };
+        }
+      } catch (e) {
+        console.error('[getCoursePublicDetails] instructor fetch failed:', e.message);
+      }
+    }
+
+    const { studentsEnrolled, ...courseWithoutEnrolled } = course;
+
+    return res.status(200).json({
+      success: true,
+      message: "Course details fetched successfully",
+      data: {
+        ...courseWithoutEnrolled,
+        instructor,
+        studentsEnrolledCount: studentsEnrolled?.length || 0,
+      },
+    });
+  } catch (err) {
+    console.error('[getCoursePublicDetails]', err);
+    return res.status(500).json({ success: false, message: 'Failed to fetch course details' });
+  }
+};
+
+export const getInstructorCourses = async (req, res) => {
+  try {
+    const instructorId = req.query.instructorId;
+
+    // Validate the instructorId
+    if (!instructorId) {
+      return res.status(400).json({
+        success: false,
+        message: "Instructor ID is required",
+      });
+    }
+
+    const courses = await Course.find({ instructor: instructorId })
+      .populate("category")
+      .populate({
+        path: "courseContent",
+        populate: {
+          path: "subSection",
+        },
+      });
+
+    // Handle no courses found
+    if (!courses || courses.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No courses found for this instructor",
+        data: [],
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Courses fetched successfully",
+      data: courses,
+    });
+  } catch (error) {
+    console.error("Error fetching instructor courses:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch instructor courses",
+      error: error.message,
+    });
+  }
+};
+
+export const deleteCourse = async (req, res) => {
+    try {
+        const { courseId } = req.body;
+        // Check if course exists
+        const course = await Course.findById(courseId);
+        if (!course) {
+            return res.status(404).json({
+                success: false,
+                message: "Course not found",
+            });
+        }
+
+        // Delete all sections and subsections related to this course
+        for (const sectionId of course.courseContent) {
+            const section = await Section.findById(sectionId);
+            if (section) {
+                await SubSection.deleteMany({ _id: { $in: section.subSection } });
+                await Section.findByIdAndDelete(sectionId);
+            }
+        }
+
+        // Remove course from instructor's course list via User Service API
+        try {
+            await userService.post('/profile/remove-course', {
+                userId: course.instructor,
+                courseId: courseId,
+            });
+        } catch (error) {
+            console.error("Error removing course from instructor:", error.message);
+            // Don't fail the deletion, but log the error
+        }
+
+        // Remove course from category
+        // if (course.category) {
+        //     await Category.findByIdAndUpdate(course.category, {
+        //         $pull: { courses: courseId },
+        //     });
+        // }
+
+        // Finally, delete the course
+        await Course.findByIdAndDelete(courseId);
+
+        return res.status(200).json({
+            success: true,
+            message: "Course deleted successfully",
+        });
+
+    } catch (error) {
+        console.error("Error deleting course:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Error deleting course. Please try again.",
+        });
+    }
+};
+
+// Get course details for payment processing (for Payment Service communication)
+export const getCourseDetailsForPayment = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    console.log("🔍 COURSE SERVICE: getCourseDetailsForPayment called with courseId:", courseId);
+
+    if (!courseId) {
+      return res.status(400).json({
+        success: false,
+        message: "Course ID is required",
+      });
+    }
+
+    const course = await Course.findById(courseId).select('_id courseName price studentsEnrolled');
+
+    console.log("🔍 COURSE SERVICE: Course found:", {
+      _id: course?._id,
+      courseName: course?.courseName,
+      price: course?.price,
+      studentsEnrolled: course?.studentsEnrolled?.length || 0
+    });
+
+    if (!course) {
+      console.log("🔍 COURSE SERVICE: Course not found for ID:", courseId);
+      return res.status(404).json({
+        success: false,
+        message: "Course not found",
+      });
+    }
+
+    console.log("🔍 COURSE SERVICE: Returning course details:", course);
+
+    return res.status(200).json({
+      success: true,
+      course,
+    });
+  } catch (error) {
+    console.error("Error getting course details for payment:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
+// Enroll student in course (for Payment Service communication)
+export const enrollStudentInCourse = async (req, res) => {
+  try {
+    const { courses, userId } = req.body;
+
+    if (!courses || !userId) {
+      return res.status(400).json({
+        success: false,
+        message: "Courses and User ID are required",
+      });
+    }
+
+    for (const courseData of courses) {
+      const courseId = typeof courseData === 'object' ? courseData.courseId : courseData;
+
+      if (!mongoose.Types.ObjectId.isValid(courseId)) {
+        console.error(`Invalid course ID: ${courseId}`);
+        continue;
+      }
+
+      const course = await Course.findById(courseId);
+      if (!course) {
+        console.error(`Course with ID ${courseId} not found`);
+        continue;
+      }
+
+      const uid = new mongoose.Types.ObjectId(userId);
+
+      // Enroll user in the course if not already enrolled
+      if (!course.studentsEnrolled.includes(uid)) {
+        course.studentsEnrolled.push(uid);
+        await course.save();
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Student enrolled in courses successfully",
+    });
+  } catch (error) {
+    console.error("Error enrolling student in course:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
+// Get courses by IDs (for User Service communication)
+export const getCourseByIds = async (req, res) => {
+  try {
+    const { ids } = req.query;
+
+    if (!ids) {
+      return res.status(400).json({
+        success: false,
+        message: "Course IDs are required",
+      });
+    }
+
+    // Split the comma-separated IDs and validate them
+    const courseIds = ids.split(',').map(id => id.trim());
+    
+    // Validate all IDs are valid ObjectIds
+    for (const id of courseIds) {
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid course ID: ${id}`,
+        });
+      }
+    }
+
+    // Fetch courses with populated courseContent and subSection
+    const courses = await Course.find({ _id: { $in: courseIds } })
+      .populate({
+        path: 'courseContent',
+        populate: {
+          path: 'subSection',
+        },
+      })
+      .exec();
+
+    if (!courses || courses.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No courses found for the provided IDs",
+        data: [],
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Courses fetched successfully",
+      data: courses,
+    });
+  } catch (error) {
+    console.error("Error getting courses by IDs:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+// Get enrolled students with progress for a course
+export const getEnrolledStudentsWithProgress = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    if (!courseId) {
+      return res.status(400).json({
+        success: false,
+        message: "Course ID is required",
+      });
+    }
+
+    // Validate courseId is a valid ObjectId
+    if (!mongoose.Types.ObjectId.isValid(courseId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid course ID",
+      });
+    }
+
+    // Get course details without students population
+    const course = await Course.findById(courseId)
+      .populate('category')
+      .populate({
+        path: 'courseContent',
+        populate: {
+          path: 'subSection',
+        },
+      })
+      .exec();
+
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        message: "Course not found",
+      });
+    }
+
+    // Get enrolled students details via user-service
+    let studentsDetails = [];
+    if (course.studentsEnrolled && course.studentsEnrolled.length > 0) {
+      try {
+        const studentsResponse = await userService.get('/auth/get-instructors-by-ids', {
+          params: { ids: course.studentsEnrolled.join(','), fields: 'firstName,lastName,image,additionalDetails' },
+        });
+        studentsDetails = studentsResponse.data?.data || [];
+      } catch (error) {
+        console.error("Error fetching students details:", error.message);
+        // Continue without students details if user service is unavailable
+      }
+    }
+
+    // Get course progress for each student
+    let courseProgressData = [];
+    if (course.studentsEnrolled && course.studentsEnrolled.length > 0) {
+      try {
+        courseProgressData = await CourseProgress.find({
+          courseID: courseId,
+          userId: { $in: course.studentsEnrolled }
+        }).populate('completedVideos');
+      } catch (error) {
+        console.error("Error fetching course progress:", error);
+        // Continue without progress data if CourseProgress model issues occur
+      }
+    }
+
+    // Merge student details with progress data
+    const studentsWithProgress = studentsDetails.map(student => {
+      const progress = courseProgressData.find(cp => cp.userId.toString() === student._id.toString());
+      return {
+        ...student,
+        progress: progress || { completedVideos: [] }
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Enrolled students with progress fetched successfully",
+      data: {
+        course: {
+          _id: course._id,
+          courseName: course.courseName,
+          category: course.category,
+          courseContent: course.courseContent
+        },
+        enrolledStudents: studentsWithProgress,
+        totalEnrolled: course.studentsEnrolled.length
+      },
+    });
+  } catch (error) {
+    console.error("Error getting enrolled students with progress:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+export const updateCourseProgress = async (req, res) => {
+  try {
+    const { userId, courseId, subSectionId } = req.body;
+
+    if (!userId || !courseId || !subSectionId) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+
+    // Validate ObjectId formats
+    if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(courseId) || !mongoose.Types.ObjectId.isValid(subSectionId)) {
+      return res.status(400).json({ success: false, message: "Invalid id format" });
+    }
+
+    // Find the user's progress for this course (unique per user+course)
+    let progress = await CourseProgress.findOne({ courseID: courseId, userId });
+
+    // If progress doesn't exist, create a new entry
+    if (!progress) {
+      progress = new CourseProgress({
+        courseID: courseId,
+        userId,
+        completedVideos: [],
+      });
+    }
+
+    // Ensure completedVideos contains the subSectionId
+    const subIdStr = subSectionId.toString();
+    const alreadyCompleted = progress.completedVideos.some(id => id.toString() === subIdStr);
+    if (!alreadyCompleted) {
+      progress.completedVideos.push(subSectionId);
+      await progress.save();
+      // Notify user-service to add this progress reference to the user's profile
+      try {
+        await userService.post('/profile/add-course-progress', {
+          userId,
+          progressId: progress._id,
+        });
+      } catch (err) {
+        console.error('Failed to notify user-service about progress:', err.message || err);
+        // don't fail the request if user-service is down
+      }
+    }
+
+    // Return the updated progress object
+    return res.status(200).json({
+      success: true,
+      message: "Lecture marked as completed",
+      progress,
+    });
+
+  } catch (error) {
+    console.error("Error updating course progress:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+};
+
+// ----------------------- Admin endpoints -----------------------
+export const adminListCourses = async (req, res) => {
+  try {
+    console.log("Admin list courses called with query:", req.query);
+    console.log("Authenticated user:");
+    const { status, page = 1, limit = 20, search } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    if (search) filter.courseName = { $regex: search, $options: 'i' };
+
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const [total, courses] = await Promise.all([
+      Course.countDocuments(filter),
+      Course.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .populate('category')
+        .populate({ path: 'courseContent', populate: { path: 'subSection' } }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Admin course list fetched successfully',
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      data: courses,
+    });
+  } catch (error) {
+    console.error('Error in adminListCourses:', error);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const approveCourse = async (req, res) => {
+  try {
+    const courseId = req.body.courseId || req.params.id;
+    if (!courseId || !mongoose.Types.ObjectId.isValid(courseId)) {
+      return res.status(400).json({ success: false, message: 'Valid courseId is required' });
+    }
+
+    const course = await Course.findByIdAndUpdate(
+      courseId,
+      { status: 'Published' },
+      { new: true }
+    ).populate('category');
+
+    if (!course) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    return res.status(200).json({ success: true, message: 'Course approved', data: course });
+  } catch (error) {
+    console.error('Error approving course:', error);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const rejectCourse = async (req, res) => {
+  try {
+    const courseId = req.body.courseId || req.params.id;
+    if (!courseId || !mongoose.Types.ObjectId.isValid(courseId)) {
+      return res.status(400).json({ success: false, message: 'Valid courseId is required' });
+    }
+
+    const course = await Course.findByIdAndUpdate(
+      courseId,
+      { status: 'Draft' },
+      { new: true }
+    ).populate('category');
+
+    if (!course) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    return res.status(200).json({ success: true, message: 'Course rejected (moved to Draft)', data: course });
+  } catch (error) {
+    console.error('Error rejecting course:', error);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const getCourseAnalytics = async (req, res) => {
+  try {
+    const courseId = req.params.courseId || req.params.id;
+    if (!courseId || !mongoose.Types.ObjectId.isValid(courseId)) {
+      return res.status(400).json({ success: false, message: 'Valid courseId is required' });
+    }
+
+    const course = await Course.findById(courseId)
+      .populate({ path: 'courseContent', populate: { path: 'subSection' } })
+      .exec();
+
+    if (!course) return res.status(404).json({ success: false, message: 'Course not found' });
+
+    const totalEnrolled = (course.studentsEnrolled && course.studentsEnrolled.length) || 0;
+    const price = course.price || 0;
+    const revenue = price * totalEnrolled;
+
+    // Count total lectures (subsections)
+    let totalLectures = 0;
+    if (course.courseContent && course.courseContent.length > 0) {
+      totalLectures = course.courseContent.reduce((acc, section) => {
+        const subs = section.subSection || [];
+        return acc + subs.length;
+      }, 0);
+    }
+
+    // Fetch progress entries for this course
+    const progressEntries = await CourseProgress.find({ courseID: courseId, userId: { $in: course.studentsEnrolled } }).lean();
+
+    // compute per-student completion and average completion
+    let perStudent = [];
+    let avgCompletion = 0;
+
+    if (totalEnrolled > 0 && totalLectures > 0) {
+      perStudent = progressEntries.map(p => {
+        const completed = (p.completedVideos && p.completedVideos.length) || 0;
+        const completionPct = Math.min(100, Math.round((completed / totalLectures) * 100));
+        return { userId: p.userId, completed, completionPct };
+      });
+
+      if (perStudent.length > 0) {
+        avgCompletion = Math.round(perStudent.reduce((s, x) => s + x.completionPct, 0) / perStudent.length);
+      } else {
+        avgCompletion = 0;
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        courseId: course._id,
+        courseName: course.courseName,
+        totalEnrolled,
+        revenue,
+        totalLectures,
+        averageCompletionRate: avgCompletion, // percentage
+        perStudentProgress: perStudent,
+      },
+    });
+  } catch (error) {
+    console.error('Error getting course analytics:', error);
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
